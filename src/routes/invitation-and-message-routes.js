@@ -49,7 +49,7 @@ const isEnum = (v, allowed) => allowed.includes(v);
 // -----------------------------------------------------------------------------
 // SQL snippet
 // -----------------------------------------------------------------------------
-const INVITATION_COLUMNS = `id, \`from\`, name, category, phone, qty, type, slug, qrcode, rsvp_status, checked_in, checked_in_at, created_at, real_qty`;
+const INVITATION_COLUMNS = `id, \`from\`, name, category, phone, qty, type, slug, qrcode, rsvp_status, checked_in, checked_in_at, created_at, real_qty, is_sent, is_copied`;
 const SELECT_INVITATION_BASE = `SELECT ${INVITATION_COLUMNS} FROM invitations`;
 
 const SELECT_WITH_CAPTION = `
@@ -156,7 +156,7 @@ router.post('/', awrap(async (req, res) => {
   const catVal = category == null ? null : Number(category);
   const slug = await generateUniqueSlug();
   const link = buildInvitationLink(slug);
-  const qrcode = buildQrUrl(link);
+  const qrcode = buildQrUrl(slug); // QR hanya mengandung slug
 
   const sql = `INSERT INTO invitations (\`from\`, name, category, phone, qty, type, slug, qrcode)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
@@ -170,6 +170,52 @@ router.post('/', awrap(async (req, res) => {
     qrcode,
     confirm_link: link,
     invite_link: buildInviteViewLink(slug)
+  });
+}));
+
+// ✅ PATCH Status kirim WA / copy link
+router.patch('/:slug/status', awrap(async (req, res) => {
+  const { slug } = req.params;
+  const { is_sent, is_copied } = req.body;
+
+  if (is_sent === undefined && is_copied === undefined) {
+    return res.status(400).json({ error: 'Minimal satu dari is_sent atau is_copied harus disertakan.' });
+  }
+
+  const updates = [];
+  const params = [];
+
+  if (is_sent !== undefined) {
+    updates.push('is_sent = ?');
+    params.push(!!is_sent ? 1 : 0);
+  }
+  if (is_copied !== undefined) {
+    updates.push('is_copied = ?');
+    params.push(!!is_copied ? 1 : 0);
+  }
+
+  params.push(slug);
+
+  const sql = `UPDATE invitations SET ${updates.join(', ')} WHERE slug = ?`;
+  const [result] = await db.query(sql, params);
+
+  if (result.affectedRows === 0) {
+    // Cek apakah slug benar-benar tidak ada, atau hanya nilainya tidak berubah
+    const [[existing]] = await db.query('SELECT id FROM invitations WHERE slug = ?', [slug]);
+    if (!existing) return res.status(404).json({ error: 'Undangan tidak ditemukan.' });
+
+    // Nilai sama → tetap dianggap berhasil
+    return res.json({ message: 'Status tidak berubah (sudah sama).' });
+  }
+
+  const [[updated]] = await db.query(
+    'SELECT is_sent, is_copied FROM invitations WHERE slug = ? LIMIT 1',
+    [slug]
+  );
+
+  res.json({
+    message: 'Status berhasil diperbarui.',
+    ...updated,
   });
 }));
 
@@ -228,18 +274,46 @@ router.patch('/:slug/kehadiran', awrap(async (req, res) => {
   const { slug } = req.params;
   let { rsvp_status, jumlah_real } = req.body;
 
-  if (!required(rsvp_status)) return res.status(400).json({ error: 'rsvp_status wajib diisi.' });
-  if (!isEnum(rsvp_status, ['Belum Konfirmasi', 'Hadir', 'Tidak Hadir'])) {
-    return res.status(400).json({ error: "rsvp_status harus salah satu: 'Belum Konfirmasi','Hadir','Tidak Hadir'." });
+  // Validasi status wajib diisi
+  if (!required(rsvp_status)) {
+    return res.status(400).json({ error: 'rsvp_status wajib diisi.' });
   }
 
-  jumlah_real = jumlah_real == null || jumlah_real === '' ? null : Number(jumlah_real);
+  // Validasi status harus salah satu dari 3 opsi
+  if (!isEnum(rsvp_status, ['Belum Konfirmasi', 'Hadir', 'Tidak Hadir'])) {
+    return res.status(400).json({
+      error: "rsvp_status harus salah satu: 'Belum Konfirmasi', 'Hadir', 'Tidak Hadir'."
+    });
+  }
 
-  const [result] = await db.query('UPDATE invitations SET rsvp_status = ?, real_qty = ? WHERE slug = ?', [rsvp_status, jumlah_real, slug]);
-  if (!result.affectedRows) return res.status(404).json({ error: 'Undangan tidak ditemukan.' });
+  // Jika Tidak Hadir → jumlah_real otomatis 0
+  if (rsvp_status === 'Tidak Hadir') {
+    jumlah_real = 0;
+  } else {
+    // Konversi ke angka, atau null jika kosong
+    jumlah_real = jumlah_real == null || jumlah_real === '' ? null : Number(jumlah_real);
+  }
 
-  const [[updated]] = await db.query('SELECT rsvp_status, real_qty FROM invitations WHERE slug = ?', [slug]);
-  res.json({ message: 'Kehadiran berhasil dikonfirmasi.', ...updated });
+  // Update ke DB
+  const [result] = await db.query(
+    'UPDATE invitations SET rsvp_status = ?, real_qty = ? WHERE slug = ?',
+    [rsvp_status, jumlah_real, slug]
+  );
+
+  if (!result.affectedRows) {
+    return res.status(404).json({ error: 'Undangan tidak ditemukan.' });
+  }
+
+  // Ambil data yang sudah diupdate + QR jika ada
+  const [[updated]] = await db.query(
+    'SELECT rsvp_status, real_qty AS jumlah_real, qrcode FROM invitations WHERE slug = ?',
+    [slug]
+  );
+
+  res.json({
+    message: 'Kehadiran berhasil dikonfirmasi.',
+    ...updated,
+  });
 }));
 
 // ✅ PATCH Check-in via QR
@@ -278,14 +352,6 @@ router.patch('/checkin/:slug', awrap(async (req, res) => {
     qty_recorded: qtyToUse,
     scan_count: scanCount
   });
-}));
-
-// ✅ DELETE Invitation
-router.delete('/:id', awrap(async (req, res) => {
-  const { id } = req.params;
-  const [result] = await db.query('DELETE FROM invitations WHERE id = ?', [id]);
-  if (!result.affectedRows) return res.status(404).json({ error: 'Undangan tidak ditemukan.' });
-  res.json({ message: 'Undangan dihapus.' });
 }));
 
 // ============================================================================

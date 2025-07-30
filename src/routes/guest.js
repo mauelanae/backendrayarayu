@@ -17,6 +17,7 @@ router.get('/', async (req, res) => {
                 i.qrcode AS linkUndangan,
                 i.created_at,
                 c.name AS kategori,
+                c.id AS category_id,
                 i.type,
                 i.checked_in AS checked_in,
                 i.checked_in_at AS checked_in_at
