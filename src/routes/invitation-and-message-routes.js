@@ -2,6 +2,8 @@ import express from 'express';
 import db from '../config/db.js';
 import slugify from 'slugify';
 import dotenv from 'dotenv';
+import multer from 'multer';
+import xlsx from 'xlsx';
 
 dotenv.config();
 
@@ -11,6 +13,8 @@ const messageRouter = express.Router();
 const BASE_LINK = process.env.INVITATION_LINK_BASE ?? '';
 const INVITE_PATH = process.env.INVITATION_INVITE_PATH ?? '/invite';        // Link yang dikirim ke tamu
 const CONFIRM_PATH = process.env.INVITATION_CONFIRM_PATH ?? '/confirm';     // Link konfirmasi internal
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 // -----------------------------------------------------------------------------
 // Utility: async wrapper untuk error handler
@@ -56,6 +60,7 @@ const SELECT_WITH_CAPTION = `
   SELECT
     i.id, i.\`from\`, i.name, i.category, i.phone, i.qty, i.type, i.slug, i.qrcode,
     i.rsvp_status, i.checked_in, i.checked_in_at, i.created_at, i.real_qty,
+    i.status_pengiriman,
     c.name AS category_name,
     (
       SELECT cap.caption_text
@@ -68,6 +73,42 @@ const SELECT_WITH_CAPTION = `
   LEFT JOIN categories c ON i.category = c.id
 `;
 
+// ✅ POST /seed-excel
+router.post('/seed-excel', upload.single('file'), awrap(async (req, res) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'File Excel wajib diunggah.' });
+
+  const workbook = xlsx.read(file.buffer, { type: 'buffer' });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const data = xlsx.utils.sheet_to_json(sheet);
+
+  for (const row of data) {
+    const { from, name, category, phone, qty, type } = row;
+    if (!name || !['digital', 'cetak'].includes(type)) continue;
+
+    const slug = await generateUniqueSlug();
+    const qrcode = buildQrUrl(slug);
+    const rsvp_status = type === 'cetak' ? 'Hadir' : 'Belum Konfirmasi';
+
+    await db.query(`
+      INSERT INTO invitations (\`from\`, name, category, phone, qty, type, slug, qrcode, rsvp_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        from ?? null,
+        name,
+        category != null ? parseInt(category) : null,
+        phone ?? null,
+        qty != null ? parseInt(qty) : null,
+        type,
+        slug,
+        qrcode,
+        rsvp_status
+      ]
+    );
+  }
+
+  res.json({ message: 'Data berhasil dimasukkan dari Excel.' });
+}));
 // ============================================================================
 // INVITATION ROUTES
 // ============================================================================
@@ -174,49 +215,27 @@ router.post('/', awrap(async (req, res) => {
 }));
 
 // ✅ PATCH Status kirim WA / copy link
+// PATCH /invitations/:slug/status
 router.patch('/:slug/status', awrap(async (req, res) => {
   const { slug } = req.params;
-  const { is_sent, is_copied } = req.body;
+  const { status_pengiriman } = req.body;
 
-  if (is_sent === undefined && is_copied === undefined) {
-    return res.status(400).json({ error: 'Minimal satu dari is_sent atau is_copied harus disertakan.' });
+  const allowedStatus = ['terkirim', 'belum_terkirim'];
+
+  if (!allowedStatus.includes(status_pengiriman)) {
+    return res.status(400).json({ error: 'Status tidak valid. Gunakan "terkirim" atau "belum_terkirim".' });
   }
 
-  const updates = [];
-  const params = [];
-
-  if (is_sent !== undefined) {
-    updates.push('is_sent = ?');
-    params.push(!!is_sent ? 1 : 0);
-  }
-  if (is_copied !== undefined) {
-    updates.push('is_copied = ?');
-    params.push(!!is_copied ? 1 : 0);
-  }
-
-  params.push(slug);
-
-  const sql = `UPDATE invitations SET ${updates.join(', ')} WHERE slug = ?`;
-  const [result] = await db.query(sql, params);
-
-  if (result.affectedRows === 0) {
-    // Cek apakah slug benar-benar tidak ada, atau hanya nilainya tidak berubah
-    const [[existing]] = await db.query('SELECT id FROM invitations WHERE slug = ?', [slug]);
-    if (!existing) return res.status(404).json({ error: 'Undangan tidak ditemukan.' });
-
-    // Nilai sama → tetap dianggap berhasil
-    return res.json({ message: 'Status tidak berubah (sudah sama).' });
-  }
-
-  const [[updated]] = await db.query(
-    'SELECT is_sent, is_copied FROM invitations WHERE slug = ? LIMIT 1',
-    [slug]
+  const [result] = await db.query(
+    'UPDATE invitations SET status_pengiriman = ? WHERE slug = ?',
+    [status_pengiriman, slug]
   );
 
-  res.json({
-    message: 'Status berhasil diperbarui.',
-    ...updated,
-  });
+  if (result.affectedRows === 0) {
+    return res.status(404).json({ error: 'Undangan tidak ditemukan.' });
+  }
+
+  return res.json({ message: 'Status pengiriman berhasil diperbarui.', status_pengiriman });
 }));
 
 // ✅ UPDATE Invitation
@@ -257,6 +276,7 @@ router.get('/', awrap(async (req, res) => {
 
   const sql = `${SELECT_WITH_CAPTION} ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY i.id DESC`;
   const [rows] = await db.query(sql, params);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.json(rows);
 }));
 

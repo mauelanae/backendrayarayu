@@ -43,6 +43,7 @@ app.use('/api/invitations/summary', summaryRouter); // alias (untuk kompatibilit
 
 // ✅ Invitations & Messages
 app.use('/api/invitations', invitationRouter);
+app.use('/api/-seed', invitationRouter); // alias untuk kompatibilitas lama
 app.use('/api/messages', messageRouter);
 
 // ✅ Categories & Guest
